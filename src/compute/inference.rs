@@ -66,6 +66,7 @@ pub struct LoadedModel {
     pub config: InferenceConfig,
     pub n_gpu_layers: i32,
     pub model_name: String,
+    pub kv_quantization: Option<crate::scheduler::types::KvQuantization>,
     // NVMe scheduling state (None when all tensors fit in GPU+RAM)
     _controller: Option<Box<HypuraBuftController>>,
     prefetch_state: Option<Arc<PrefetchState>>,
@@ -130,6 +131,7 @@ pub fn load_model(
             config: config.clone(),
             n_gpu_layers,
             model_name,
+            kv_quantization: plan.kv_cache_plan.kv_quantization,
             _controller: None,
             prefetch_state: None,
             keep_resident: false,
@@ -187,11 +189,15 @@ pub fn load_model(
     let estimated_committed = gpu_committed_estimate + buffer_bytes + runtime_overhead;
     let headroom: u64 = 4 * (1 << 30);
 
+    // Enforce 90% maximum unified memory limit (leave 10% for macOS OS/system safety)
+    let max_ram_limit = (total_ram as f64 * 0.90) as u64;
+    let effective_max_ram = max_ram_limit.min(total_ram.saturating_sub(headroom));
+
     let keep_resident = nvme_bytes > 0
-        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(headroom);
+        && (estimated_committed + nvme_bytes) <= effective_max_ram;
 
     let should_preload = keep_resident
-        && (estimated_committed + nvme_bytes) <= total_ram.saturating_sub(6 * (1 << 30));
+        && (estimated_committed + nvme_bytes) <= effective_max_ram.saturating_sub(2 * (1 << 30));
 
     if keep_resident {
         tracing::info!(
@@ -238,10 +244,200 @@ pub fn load_model(
         config: config.clone(),
         n_gpu_layers,
         model_name,
+        kv_quantization: plan.kv_cache_plan.kv_quantization,
         _controller: Some(controller),
         prefetch_state: Some(prefetch_state),
         keep_resident,
     })
+}
+
+/// Helper: find matching closing bracket `]` accounting for strings and nesting
+pub fn find_matching_bracket(s: &str) -> Option<usize> {
+    let start = s.find('[')?;
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, c) in s[start..].char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '[' {
+            depth += 1;
+        } else if c == ']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Helper: find matching closing brace `}` accounting for strings and nesting
+pub fn find_matching_brace(s: &str) -> Option<usize> {
+    let start = s.find('{')?;
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, c) in s[start..].char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Check if generation should terminate early due to stop tokens, turn boundaries, or tool call completion.
+pub fn should_stop_early(generated_text: &str, custom_stops: &[String]) -> bool {
+    // 1. User/client-specified stop sequences
+    for stop in custom_stops {
+        if !stop.is_empty() && generated_text.contains(stop.as_str()) {
+            return true;
+        }
+    }
+
+    // 2. ChatML & Qwen stop / turn boundary tokens
+    if generated_text.contains("<|im_end|>")
+        || generated_text.contains("<|im_start|>")
+        || generated_text.contains("<|endoftext|>")
+        || generated_text.contains("<|eot_id|>")
+    {
+        return true;
+    }
+
+    // 3. Mistral stop / turn boundary tokens
+    if generated_text.contains("</s>")
+        || generated_text.contains("[INST]")
+        || generated_text.contains("[AVAILABLE_TOOLS]")
+        || generated_text.contains("[/TOOL_CALLS]")
+        || generated_text.contains("[TOOL_RESULTS]")
+    {
+        return true;
+    }
+
+    // 4. Granite & Gemma stop / turn boundary tokens
+    if generated_text.contains("<|end_of_text|>")
+        || generated_text.contains("<|end_of_turn|>")
+        || generated_text.contains("<|start_of_role|>")
+        || generated_text.contains("<end_of_turn>")
+        || generated_text.contains("<start_of_turn>")
+        || generated_text.contains("<turn|>")
+        || generated_text.contains("<|turn|>")
+    {
+        return true;
+    }
+
+    // 5. Tool call closure tags or complete JSON tool call objects
+    if generated_text.contains("</tool_call>")
+        || generated_text.contains("</tool__call>")
+        || generated_text.contains("</toolcall>")
+        || generated_text.contains("<tool_call|>")
+        || generated_text.contains("</function>")
+        || generated_text.contains("[/TOOL_CALLS]")
+        || (generated_text.contains("<|tool_call|>") && (generated_text.ends_with('}') || generated_text.ends_with(']')))
+    {
+        return true;
+    }
+
+    let trimmed = generated_text.trim_start();
+
+    // Check complete [TOOL_CALLS] [...] syntax
+    if let Some(tc_idx) = trimmed.find("[TOOL_CALLS]") {
+        let after_tc = trimmed[tc_idx + "[TOOL_CALLS]".len()..].trim_start();
+        if after_tc.starts_with('[') {
+            if let Some(bracket_len) = find_matching_bracket(after_tc) {
+                let candidate = &after_tc[..bracket_len];
+                if candidate.contains("\"name\"") && serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                    return true;
+                }
+            }
+        } else if after_tc.starts_with('{') {
+            if let Some(brace_len) = find_matching_brace(after_tc) {
+                let candidate = &after_tc[..brace_len];
+                if candidate.contains("\"name\"") && serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Check complete raw JSON array [ {"name": ...} ]
+    if trimmed.starts_with('[')
+        && !trimmed.starts_with("[TOOL_CALLS]")
+        && !trimmed.starts_with("[INST]")
+        && !trimmed.starts_with("[AVAILABLE_TOOLS]")
+    {
+        if let Some(bracket_len) = find_matching_bracket(trimmed) {
+            let candidate = &trimmed[..bracket_len];
+            if candidate.contains("\"name\"") && serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    // Check complete raw JSON object { "name": ... }
+    if trimmed.starts_with('{') {
+        if let Some(brace_len) = find_matching_brace(trimmed) {
+            let candidate = &trimmed[..brace_len];
+            if candidate.contains("\"name\"") && serde_json::from_str::<serde_json::Value>(candidate).is_ok() {
+                return true;
+            }
+        }
+    }
+
+    // 6. Prevent reasoning over-thinking loops (e.g. model finished thinking, gave answer, then reopened <think>)
+    if generated_text.contains("</think>") {
+        if let Some(think_end) = generated_text.find("</think>") {
+            let after_think = &generated_text[think_end + "</think>".len()..];
+            if after_think.contains("<think>") || after_think.contains("<thought>") {
+                return true;
+            }
+        }
+    }
+    if generated_text.contains("</thought>") {
+        if let Some(thought_end) = generated_text.find("</thought>") {
+            let after_thought = &generated_text[thought_end + "</thought>".len()..];
+            if after_thought.contains("<thought>") || after_thought.contains("<think>") {
+                return true;
+            }
+        }
+    }
+
+    false
 }
 
 /// Generate text from a pre-loaded model.
@@ -258,17 +454,28 @@ pub fn generate_from_loaded(
         telemetry,
     } = params;
 
-    // Build context — with or without NVMe callback
     let config = &loaded.config;
+    let tokens = loaded.model.tokenize(prompt, true, true);
+    let prompt_len = tokens.len() as u32;
+    anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
+
+    // Dynamic context calculation: ensure adequate headroom for generation beyond the prompt,
+    // scaling up beyond config.n_ctx if large tool outputs are fed into the prompt.
+    let gen_headroom = sampling.max_tokens.min(4096).max(512);
+    let requested_ctx = prompt_len + gen_headroom;
+    let effective_ctx = requested_ctx.max(config.n_ctx);
+
+    // Build context — with or without NVMe callback, respecting KV cache quantization
     let mut ctx = if let Some(ref prefetch_state) = loaded.prefetch_state {
         let state_ptr = Arc::into_raw(prefetch_state.clone()) as *mut std::ffi::c_void;
-        let ctx = LlamaContext::new_with_callback(
+        let ctx = LlamaContext::new_with_callback_and_kv(
             &loaded.model,
-            config.n_ctx,
+            effective_ctx,
             config.n_batch,
             config.n_threads,
             Some(eval_callback),
             state_ptr,
+            loaded.kv_quantization,
         )?;
         // Immediately convert back to avoid leak — the PrefetchState is kept alive
         // by the Arc in LoadedModel, not by this raw pointer.
@@ -277,14 +484,18 @@ pub fn generate_from_loaded(
         }
         ctx
     } else {
-        LlamaContext::new(&loaded.model, config.n_ctx, config.n_batch, config.n_threads)?
+        LlamaContext::new_with_callback_and_kv(
+            &loaded.model,
+            effective_ctx,
+            config.n_batch,
+            config.n_threads,
+            None,
+            std::ptr::null_mut(),
+            loaded.kv_quantization,
+        )?
     };
 
     let mut sampler = LlamaSampler::new(sampling);
-
-    let tokens = loaded.model.tokenize(prompt, true, true);
-    let prompt_len = tokens.len() as u32;
-    anyhow::ensure!(!tokens.is_empty(), "Prompt tokenized to zero tokens");
 
     // Prefetch NVMe layers before prompt eval
     if let Some(ref state) = loaded.prefetch_state {
@@ -307,6 +518,7 @@ pub fn generate_from_loaded(
     for _ in 0..sampling.max_tokens {
         let token_id = sampler.sample(&mut ctx, -1);
         let is_eog = loaded.model.is_eog(token_id);
+        let is_control = loaded.model.is_control(token_id);
         let piece = loaded.model.token_to_piece(token_id);
 
         n_generated += 1;
@@ -326,7 +538,7 @@ pub fn generate_from_loaded(
 
         if token_tx
             .send(GeneratedToken {
-                text: piece,
+                text: piece.clone(),
                 token_id,
                 tok_per_sec,
                 is_eog,
@@ -340,10 +552,20 @@ pub fn generate_from_loaded(
             break;
         }
 
-        if !loaded.keep_resident {
-            if let Some(ref state) = loaded.prefetch_state {
-                state.prefetch_all_nvme();
-            }
+        if is_control
+            && (piece.contains("end")
+                || piece.contains("im_end")
+                || piece.contains("eot")
+                || piece.contains("stop")
+                || piece.contains("start_of_role")
+                || piece.contains("im_start")
+                || piece.contains("INST"))
+        {
+            break;
+        }
+
+        if should_stop_early(&generated_text, &sampling.stop_sequences) {
+            break;
         }
 
         ctx.decode(&[token_id])?;
@@ -370,20 +592,47 @@ pub fn generate_from_loaded(
 /// Compute GPU budget for model weights (bytes) after reserving space for
 /// KV cache and compute buffers within the Metal working set.
 pub fn compute_gpu_budget(hw: &HardwareProfile, metadata: &ModelMetadata, context_length: u32) -> u64 {
-    let gpu_working_set = hw.gpu.as_ref().map_or(0, |g| g.vram_bytes);
-    // KV cache on GPU: 2 * layers * kv_heads * head_dim * 2 bytes * context
-    let head_dim = if metadata.num_heads > 0 {
-        metadata.embedding_dim as u64 / metadata.num_heads as u64
+    let raw_vram = hw.gpu.as_ref().map_or(0, |g| g.vram_bytes);
+    let max_memory_limit = (hw.memory.total_bytes as f64 * 0.90) as u64;
+    let gpu_working_set = raw_vram.min(max_memory_limit);
+
+    // KV cache on GPU: for MLA models (like GLM-4 MoE Lite, DeepSeek), KV is compressed (576 dims per token)
+    let arch_lower = metadata.architecture.to_lowercase();
+    let is_mla = arch_lower.contains("glm4moe") || arch_lower.contains("deepseek2") || arch_lower.contains("deepseek3");
+
+    let kv_on_gpu = if is_mla {
+        // 576 bytes per layer * Q8_0 (1 byte/elem) * layers * context
+        576 * metadata.num_layers as u64 * context_length as u64
     } else {
-        0
+        let head_dim = if metadata.num_heads > 0 {
+            metadata.embedding_dim as u64 / metadata.num_heads as u64
+        } else {
+            0
+        };
+        2 * metadata.num_layers as u64
+            * metadata.num_kv_heads as u64
+            * head_dim
+            * 2
+            * context_length as u64
     };
-    let kv_on_gpu = 2 * metadata.num_layers as u64
-        * metadata.num_kv_heads as u64
-        * head_dim
-        * 2
-        * context_length as u64;
-    // Reserve 2 GiB for compute buffers + Metal framework overhead
-    let runtime_overhead: u64 = 2 * (1 << 30);
+
+    // Reserve headroom for Metal compute graph splits (150+ splits on dense models), SSM recurrent state buffers, and display compositor
+    let is_ssm_hybrid = arch_lower.contains("gemma")
+        || arch_lower.contains("delta")
+        || arch_lower.contains("mamba")
+        || arch_lower.contains("rwkv")
+        || arch_lower.contains("jamba");
+
+    let runtime_overhead: u64 = if is_ssm_hybrid {
+        // Gated Delta Net and recurrent state buffers create substantial Metal intermediate allocations
+        5800 * 1024 * 1024 // 5.8 GB safety buffer on unified memory
+    } else if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
+        // On 24 GB machines, macOS WindowServer + system memory pressure requires 4.8 GB safety buffer
+        4800 * 1024 * 1024
+    } else {
+        3800 * 1024 * 1024
+    };
+
     gpu_working_set
         .saturating_sub(kv_on_gpu)
         .saturating_sub(runtime_overhead)
@@ -403,27 +652,21 @@ pub fn gpu_layers_from_placement(
     gguf: &GgufFile,
     gpu_budget_bytes: u64,
 ) -> i32 {
-    // SparseMoeMmap: if model fits in GPU, offload all layers. If not, use CPU-only
-    // (ngl=0) and rely on mmap + OS page cache for the sparse active working set.
+    // SparseMoeMmap: if model fits entirely in GPU, offload all layers. If not,
+    // offload as many layers as fit in the GPU budget rather than falling back to CPU-only (ngl=0).
     if plan.inference_mode == InferenceMode::SparseMoeMmap {
         let total_bytes = gguf.total_tensor_bytes();
         if total_bytes <= gpu_budget_bytes {
             let max_layer = gguf.tensors.iter().filter_map(|t| t.layer_index).max().unwrap_or(0);
             return max_layer as i32 + 1 + 1; // all layers + output
-        } else {
-            tracing::info!(
-                "Sparse MoE mmap: model ({:.1} GB) exceeds GPU budget ({:.1} GB), using CPU-only (ngl=0)",
-                total_bytes as f64 / (1u64 << 30) as f64,
-                gpu_budget_bytes as f64 / (1u64 << 30) as f64,
-            );
-            return 0;
         }
+        // Fall through to compute max fitting layers within gpu_budget_bytes below
     }
 
     let expert_streaming = plan.inference_mode == InferenceMode::ExpertStreaming;
     let dense_ffn_streaming = plan.inference_mode == InferenceMode::DenseFfnStreaming;
     let mut max_layer: i32 = -1;
-    let mut first_nvme_layer: Option<u32> = None;
+    let mut first_non_gpu_layer: Option<u32> = None;
 
     // Compute per-layer sizes (excluding streamed tensors from GPU budget)
     let mut layer_sizes: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
@@ -448,8 +691,8 @@ pub fn gpu_layers_from_placement(
             }
 
             *layer_sizes.entry(layer_idx).or_default() += t.size_bytes;
-            if plan.tier_assignments.get(&t.name) == Some(&StorageTier::Nvme) {
-                first_nvme_layer = Some(match first_nvme_layer {
+            if plan.tier_assignments.get(&t.name) != Some(&StorageTier::Gpu) {
+                first_non_gpu_layer = Some(match first_non_gpu_layer {
                     Some(existing) => existing.min(layer_idx),
                     None => layer_idx,
                 });
@@ -461,9 +704,9 @@ pub fn gpu_layers_from_placement(
         return 0;
     }
 
-    // Cap by NVMe cutoff (in expert-streaming, first_nvme_layer is None → no cap)
-    let from_nvme = match first_nvme_layer {
-        Some(nvme_start) => nvme_start as i32 + 1,
+    // Cap by plan cutoff (first layer with non-GPU tensors stays on CPU)
+    let from_plan = match first_non_gpu_layer {
+        Some(non_gpu_start) => non_gpu_start as i32,
         None => max_layer + 1 + 1,
     };
 
@@ -484,10 +727,13 @@ pub fn gpu_layers_from_placement(
             break;
         }
     }
-    // +1 for the output layer llama.cpp counts separately
-    let from_capacity = max_fitting + 1;
+    let from_capacity = if max_fitting == max_layer + 1 {
+        max_fitting + 1
+    } else {
+        max_fitting
+    };
 
-    from_nvme.min(from_capacity)
+    from_plan.min(from_capacity)
 }
 
 /// Run inference on a blocking thread. Streams tokens via `token_tx`.
@@ -527,6 +773,7 @@ pub fn generate_blocking(
     for _ in 0..config.sampling.max_tokens {
         let token_id = sampler.sample(&mut ctx, -1);
         let is_eog = model.is_eog(token_id);
+        let is_control = model.is_control(token_id);
         let piece = model.token_to_piece(token_id);
 
         n_generated += 1;
@@ -545,7 +792,7 @@ pub fn generate_blocking(
         });
 
         let gen_token = GeneratedToken {
-            text: piece,
+            text: piece.clone(),
             token_id,
             tok_per_sec,
             is_eog,
@@ -556,6 +803,22 @@ pub fn generate_blocking(
         }
 
         if is_eog {
+            break;
+        }
+
+        if is_control
+            && (piece.contains("end")
+                || piece.contains("im_end")
+                || piece.contains("eot")
+                || piece.contains("stop")
+                || piece.contains("start_of_role")
+                || piece.contains("im_start")
+                || piece.contains("INST"))
+        {
+            break;
+        }
+
+        if should_stop_early(&generated_text, &config.sampling.stop_sequences) {
             break;
         }
 
@@ -1012,6 +1275,7 @@ pub fn generate_with_nvme_scheduling(
     for _ in 0..config.sampling.max_tokens {
         let token_id = sampler.sample(&mut ctx, -1);
         let is_eog = model.is_eog(token_id);
+        let is_control = model.is_control(token_id);
         let piece = model.token_to_piece(token_id);
 
         n_generated += 1;
@@ -1031,7 +1295,7 @@ pub fn generate_with_nvme_scheduling(
 
         if token_tx
             .send(GeneratedToken {
-                text: piece,
+                text: piece.clone(),
                 token_id,
                 tok_per_sec,
                 is_eog,
@@ -1042,6 +1306,22 @@ pub fn generate_with_nvme_scheduling(
         }
 
         if is_eog {
+            break;
+        }
+
+        if is_control
+            && (piece.contains("end")
+                || piece.contains("im_end")
+                || piece.contains("eot")
+                || piece.contains("stop")
+                || piece.contains("start_of_role")
+                || piece.contains("im_start")
+                || piece.contains("INST"))
+        {
+            break;
+        }
+
+        if should_stop_early(&generated_text, &config.sampling.stop_sequences) {
             break;
         }
 
@@ -1219,8 +1499,8 @@ mod tests {
             assignments.insert(t.name.clone(), tier);
         }
         let plan = make_plan(assignments);
-        // Layers 0-5 on GPU (6 layers) + 1 output = 7
-        assert_eq!(gpu_layers_from_placement(&plan, &gguf, u64::MAX), 7);
+        // Layers 0-5 on GPU (6 layers)
+        assert_eq!(gpu_layers_from_placement(&plan, &gguf, u64::MAX), 6);
     }
 
     #[test]
@@ -1233,5 +1513,33 @@ mod tests {
         };
         let plan = make_plan(HashMap::new());
         assert_eq!(gpu_layers_from_placement(&plan, &gguf, u64::MAX), 0);
+    }
+
+    #[test]
+    fn test_should_stop_early() {
+        let empty_stops: Vec<String> = vec![];
+        // ChatML / Qwen
+        assert!(should_stop_early("Here is the answer.<|im_end|>", &empty_stops));
+        assert!(should_stop_early("Here is the answer.\n<|im_start|>user", &empty_stops));
+        // Mistral
+        assert!(should_stop_early("Result: 42</s>", &empty_stops));
+        assert!(should_stop_early("Result: 42\n[INST]", &empty_stops));
+        // Granite
+        assert!(should_stop_early("Result: 42<|end_of_text|>", &empty_stops));
+        assert!(should_stop_early("Result: 42<|start_of_role|>user", &empty_stops));
+        // Tool call closure
+        assert!(should_stop_early("<tool_call>\n{\"name\": \"test\", \"arguments\": {}}\n</tool_call>", &empty_stops));
+        // Tool call partial should NOT stop
+        assert!(!should_stop_early("[TOOL_CALLS][\n   {\n     \"name\":", &empty_stops));
+        assert!(!should_stop_early("[TOOL_CALLS][\n   {\n     \"name\": \"get_devices_by_name\",\n     \"arguments\": {", &empty_stops));
+        // Complete [TOOL_CALLS] array should stop
+        assert!(should_stop_early("[TOOL_CALLS][\n   {\n     \"name\": \"get_devices_by_name\",\n     \"arguments\": {}\n   }\n]", &empty_stops));
+        // Thinking loop prevention
+        assert!(should_stop_early("<think>analyzing</think>\nDone!\n<think>wait", &empty_stops));
+        // Custom stop
+        let custom_stops = vec!["### Human:".to_string()];
+        assert!(should_stop_early("Done.\n### Human:", &custom_stops));
+        // Normal text should not stop
+        assert!(!should_stop_early("Here are 3 weather stations with the lowest temperature:\n1. Station A", &empty_stops));
     }
 }

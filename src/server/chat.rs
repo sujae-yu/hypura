@@ -1,14 +1,1555 @@
-use crate::server::ollama_types::ChatMessage;
+use crate::server::ollama_types::{ChatMessage, FunctionCall, ToolCall};
 
-/// Format chat messages into a ChatML prompt string.
-pub fn format_chat_prompt(messages: &[ChatMessage]) -> String {
-    let mut prompt = String::new();
-    for msg in messages {
-        prompt.push_str(&format!(
-            "<|im_start|>{}\n{}<|im_end|>\n",
-            msg.role, msg.content
-        ));
+/// Format chat messages (and optional tool definitions) into a prompt string
+/// customized for the underlying model architecture (e.g. GPT-OSS / Harmony vs ChatML).
+pub fn format_chat_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+    hint: Option<&str>,
+) -> String {
+    let l = hint.unwrap_or_default().to_lowercase();
+
+    let is_gpt_oss = l.contains("gptoss") || l.contains("gpt-oss") || l.contains("openai_moe");
+    if is_gpt_oss {
+        return format_gptoss_chat_prompt(messages, tools);
     }
+
+    let is_qwen = l.contains("qwen");
+    if is_qwen {
+        return format_qwen_chat_prompt(messages, tools);
+    }
+
+    let is_granite = l.contains("granite") || l.contains("<|start_of_role|>");
+    if is_granite {
+        return format_granite_chat_prompt(messages, tools);
+    }
+
+    let is_glm = l.contains("glm") || l.contains("[gmask]");
+    if is_glm {
+        return format_glm_chat_prompt(messages, tools);
+    }
+
+    let is_gemma = l.contains("gemma") || l.contains("<start_of_turn>");
+    if is_gemma {
+        return format_gemma_chat_prompt(messages, tools);
+    }
+
+    let is_mistral = l.contains("mistral")
+        || l.contains("ministral")
+        || l.contains("codestral")
+        || l.contains("nemo")
+        || l.contains("[available_tools]")
+        || l.contains("[tool_calls]");
+    if is_mistral {
+        return format_mistral_chat_prompt(messages, tools);
+    }
+
+    let mut prompt = String::new();
+
+    // Default ChatML format
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let base_system = system_msg.map(|m| m.content.as_str());
+
+    let tools_array = tools.and_then(|val| match val {
+        serde_json::Value::Array(arr) if !arr.is_empty() => Some(val),
+        _ => None,
+    });
+
+    if let Some(tools_json) = tools_array {
+        let clean_tools: Vec<&serde_json::Value> = match tools_json {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .map(|t| t.get("function").unwrap_or(t))
+                .collect(),
+            _ => vec![tools_json],
+        };
+        let tools_str = serde_json::to_string_pretty(&clean_tools).unwrap_or_default();
+        prompt.push_str("<|im_start|>system\n");
+        if let Some(sys) = base_system {
+            prompt.push_str(sys);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n");
+        prompt.push_str("You are provided with function signatures within <tools></tools> XML tags:\n<tools>\n");
+        prompt.push_str(&tools_str);
+        prompt.push_str("\n</tools>\n\nIMPORTANT TOOL CALL RULES:\n");
+        prompt.push_str("1. If a function requires parameters (such as latitude, longitude, or ID) that are unknown or missing in the user query, ALWAYS call the prerequisite lookup tool FIRST (e.g., call `get_coordinates` or geocoding before searching for devices around a location).\n");
+        prompt.push_str("2. NEVER invent, guess, or hallucinate latitude, longitude, or coordinate numbers.\n");
+        prompt.push_str("3. Return each function call as a JSON object within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"arg_name\": \"arg_value\"}}\n</tool_call>\n");
+        prompt.push_str("4. When answering the user directly after tool results, provide the final answer in markdown and STOP immediately.<|im_end|>\n");
+    } else if let Some(sys) = base_system {
+        prompt.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+    }
+
+    for msg in messages {
+        if msg.role == "system" {
+            continue;
+        }
+        if msg.role == "tool" {
+            prompt.push_str("<|im_start|>tool\n");
+            prompt.push_str(&msg.content);
+            prompt.push_str("<|im_end|>\n");
+            continue;
+        }
+        prompt.push_str(&format!("<|im_start|>{}\n", msg.role));
+        if !msg.content.is_empty() {
+            prompt.push_str(&msg.content);
+        }
+        if let Some(ref tool_calls) = msg.tool_calls {
+            for tc in tool_calls {
+                let call_obj = serde_json::json!({
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                });
+                prompt.push_str(&format!(
+                    "<tool_call>\n{}\n</tool_call>",
+                    serde_json::to_string(&call_obj).unwrap_or_default()
+                ));
+            }
+        }
+        prompt.push_str("<|im_end|>\n");
+    }
+
     prompt.push_str("<|im_start|>assistant\n");
     prompt
+}
+
+/// Specialized prompt formatting for OpenAI Harmony / GPT-OSS models.
+fn format_gptoss_chat_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> String {
+    let mut prompt = String::new();
+
+    let tools_array = tools.and_then(|val| match val {
+        serde_json::Value::Array(arr) if !arr.is_empty() => Some(val),
+        _ => None,
+    });
+
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let base_system = system_msg
+        .map(|m| m.content.as_str())
+        .unwrap_or("You are a helpful assistant.");
+
+    if let Some(tools_json) = tools_array {
+        let tools_str = serde_json::to_string_pretty(tools_json).unwrap_or_default();
+        prompt.push_str("<|start|>system<|message|>");
+        prompt.push_str(base_system);
+        prompt.push_str("\n\nYou have access to the following functions:\n```json\n");
+        prompt.push_str(&tools_str);
+        prompt.push_str("\n```\n\nTo call a function, respond strictly in this format:\n\
+            to=functions.<function_name><|channel|>commentary<|message|>{\"arg_name\": \"arg_value\"}<|call|>\n\
+            When no function call is needed, respond with standard text.<|end|>\n");
+    } else if let Some(sys) = system_msg {
+        prompt.push_str(&format!("<|start|>system<|message|>{}<|end|>\n", sys.content));
+    }
+
+    for msg in messages {
+        if msg.role == "system" {
+            continue;
+        }
+
+        match msg.role.as_str() {
+            "user" => {
+                prompt.push_str(&format!("<|start|>user<|message|>{}<|end|>\n", msg.content));
+            }
+            "assistant" => {
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    for tc in tool_calls {
+                        let args_str =
+                            serde_json::to_string(&tc.function.arguments).unwrap_or_default();
+                        prompt.push_str(&format!(
+                            "<|start|>assistant to=functions.{}<|channel|>commentary<|message|>{args_str}<|call|>\n",
+                            tc.function.name
+                        ));
+                    }
+                }
+                if !msg.content.is_empty() {
+                    prompt.push_str(&format!(
+                        "<|start|>assistant<|message|>{}<|return|>\n",
+                        msg.content
+                    ));
+                }
+            }
+            "tool" => {
+                prompt.push_str(&format!("<|start|>tool<|message|>{}<|end|>\n", msg.content));
+            }
+            other => {
+                prompt.push_str(&format!("<|start|>{other}<|message|>{}<|end|>\n", msg.content));
+            }
+        }
+    }
+
+    prompt.push_str("<|start|>assistant");
+    prompt
+}
+
+/// Specialized prompt formatting for Qwen 3.5 / 3.8 / Qwen 2.5 models.
+fn format_qwen_chat_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> String {
+    let mut prompt = String::new();
+
+    let tools_array = tools.and_then(|val| match val {
+        serde_json::Value::Array(arr) if !arr.is_empty() => Some(val),
+        _ => None,
+    });
+
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let base_system = system_msg.map(|m| m.content.as_str());
+
+    if let Some(tools_json) = tools_array {
+        let clean_tools: Vec<&serde_json::Value> = match tools_json {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .map(|t| t.get("function").unwrap_or(t))
+                .collect(),
+            _ => vec![tools_json],
+        };
+        let tools_str = serde_json::to_string_pretty(&clean_tools).unwrap_or_default();
+        prompt.push_str("<|im_start|>system\n");
+        if let Some(sys) = base_system {
+            prompt.push_str(sys);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("# Tools\n\nYou have access to the following functions:\n\n<tools>\n");
+        prompt.push_str(&tools_str);
+        prompt.push_str("\n</tools>\n\nTo call a function, reply with a JSON object within <tool_call></tool_call> tags:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"param_name\": \"param_value\"}}\n</tool_call>\n\nWhen providing the final answer to the user after tool execution, present your answer directly in markdown and STOP immediately. Do NOT call any further functions.<|im_end|>\n");
+    } else if let Some(sys) = base_system {
+        prompt.push_str(&format!("<|im_start|>system\n{sys}<|im_end|>\n"));
+    }
+
+    for msg in messages {
+        if msg.role == "system" {
+            continue;
+        }
+        if msg.role == "tool" {
+            prompt.push_str("<|im_start|>user\n<tool_response>\n");
+            prompt.push_str(&msg.content);
+            prompt.push_str("\n</tool_response><|im_end|>\n");
+            continue;
+        }
+        prompt.push_str(&format!("<|im_start|>{}\n", msg.role));
+        if !msg.content.is_empty() {
+            prompt.push_str(&msg.content);
+            if !msg.content.ends_with('\n') {
+                prompt.push('\n');
+            }
+        }
+        if let Some(ref tool_calls) = msg.tool_calls {
+            for tc in tool_calls {
+                let call_obj = serde_json::json!({
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                });
+                prompt.push_str(&format!(
+                    "<tool_call>\n{}\n</tool_call>\n",
+                    serde_json::to_string(&call_obj).unwrap_or_default()
+                ));
+            }
+        }
+        prompt.push_str("<|im_end|>\n");
+    }
+
+    prompt.push_str("<|im_start|>assistant\n");
+    prompt
+}
+
+/// Specialized prompt formatting for IBM Granite 3.x / 4.x models.
+fn format_granite_chat_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> String {
+    let mut prompt = String::new();
+
+    let tools_array = tools.and_then(|val| match val {
+        serde_json::Value::Array(arr) if !arr.is_empty() => Some(val),
+        _ => None,
+    });
+
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let base_system = system_msg.map(|m| m.content.as_str());
+
+    if let Some(tools_json) = tools_array {
+        let clean_tools: Vec<&serde_json::Value> = match tools_json {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .map(|t| t.get("function").unwrap_or(t))
+                .collect(),
+            _ => vec![tools_json],
+        };
+        let tools_str = serde_json::to_string_pretty(&clean_tools).unwrap_or_default();
+        prompt.push_str("<|start_of_role|>system<|end_of_role|>");
+        if let Some(sys) = base_system {
+            prompt.push_str(sys);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("You are a helpful assistant with access to the following tools:\n");
+        prompt.push_str(&tools_str);
+        prompt.push_str("\n\nTo call a tool, respond strictly with:\n<|tool_call|>[{\"name\": \"function_name\", \"arguments\": {\"arg\": \"val\"}}]\n\nWhen you have received the tool results and are answering the user, summarize the answer directly in markdown and STOP immediately.<|end_of_text|>\n");
+    } else if let Some(sys) = base_system {
+        prompt.push_str(&format!("<|start_of_role|>system<|end_of_role|>{sys}<|end_of_text|>\n"));
+    }
+
+    for msg in messages {
+        if msg.role == "system" {
+            continue;
+        }
+
+        match msg.role.as_str() {
+            "tool" => {
+                prompt.push_str("<|start_of_role|>tool_response<|end_of_role|>");
+                prompt.push_str(&msg.content);
+                prompt.push_str("<|end_of_text|>\n");
+            }
+            "assistant" => {
+                prompt.push_str("<|start_of_role|>assistant<|end_of_role|>");
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    let calls_arr: Vec<serde_json::Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            })
+                        })
+                        .collect();
+                    prompt.push_str(&format!(
+                        "<|tool_call|>{}\n",
+                        serde_json::to_string(&calls_arr).unwrap_or_default()
+                    ));
+                }
+                if !msg.content.is_empty() {
+                    prompt.push_str(&msg.content);
+                }
+                prompt.push_str("<|end_of_text|>\n");
+            }
+            "user" => {
+                prompt.push_str("<|start_of_role|>user<|end_of_role|>");
+                prompt.push_str(&msg.content);
+                prompt.push_str("<|end_of_text|>\n");
+            }
+            other => {
+                prompt.push_str(&format!(
+                    "<|start_of_role|>{other}<|end_of_role|>{}<|end_of_text|>\n",
+                    msg.content
+                ));
+            }
+        }
+    }
+
+    prompt.push_str("<|start_of_role|>assistant<|end_of_role|>");
+    prompt
+}
+
+/// Specialized prompt formatting for GLM-4 / GLM-4 MoE Lite models.
+fn format_glm_chat_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("[gMASK]<sop>");
+
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let base_system = system_msg.map(|m| m.content.as_str());
+
+    let tools_array = tools.and_then(|val| match val {
+        serde_json::Value::Array(arr) if !arr.is_empty() => Some(val),
+        _ => None,
+    });
+
+    if let Some(tools_json) = tools_array {
+        let clean_tools: Vec<&serde_json::Value> = match tools_json {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .map(|t| t.get("function").unwrap_or(t))
+                .collect(),
+            _ => vec![tools_json],
+        };
+        let tools_str = serde_json::to_string_pretty(&clean_tools).unwrap_or_default();
+        prompt.push_str("<|system|>\n");
+        if let Some(sys) = base_system {
+            prompt.push_str(sys);
+            prompt.push_str("\n\n");
+        }
+        prompt.push_str("# Tools\n\nYou have access to the following functions:\n```json\n");
+        prompt.push_str(&tools_str);
+        prompt.push_str("\n```\n\nWhen you need to call a function, reply with:\n<tool_call>\n{\"name\": \"function_name\", \"arguments\": {\"arg_name\": \"arg_value\"}}\n</tool_call>\n\nWhen you receive tool responses, summarize and answer the user query directly. Do NOT repeat previous tool calls.");
+    } else if let Some(sys) = base_system {
+        prompt.push_str(&format!("<|system|>\n{sys}"));
+    }
+
+    for msg in messages {
+        if msg.role == "system" {
+            continue;
+        }
+        if msg.role == "tool" {
+            prompt.push_str("<|observation|>\n");
+            prompt.push_str(&msg.content);
+            continue;
+        }
+        match msg.role.as_str() {
+            "user" => {
+                prompt.push_str(&format!("<|user|>\n{}", msg.content));
+            }
+            "assistant" => {
+                prompt.push_str("<|assistant|>\n");
+                if !msg.content.is_empty() {
+                    prompt.push_str(&msg.content);
+                }
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    for tc in tool_calls {
+                        let call_obj = serde_json::json!({
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        });
+                        prompt.push_str(&format!(
+                            "<tool_call>\n{}\n</tool_call>",
+                            serde_json::to_string(&call_obj).unwrap_or_default()
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    prompt.push_str("<|assistant|>\n");
+    prompt
+}
+
+/// Specialized prompt formatting for Gemma 2 / 3 / 4 models.
+fn format_gemma_chat_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> String {
+    let mut prompt = String::new();
+
+    let tools_array = tools.and_then(|val| match val {
+        serde_json::Value::Array(arr) if !arr.is_empty() => Some(val),
+        _ => None,
+    });
+
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let base_system = system_msg.map(|m| m.content.as_str());
+
+    let mut first_user = true;
+
+    for msg in messages {
+        if msg.role == "system" {
+            continue;
+        }
+
+        if msg.role == "tool" {
+            prompt.push_str("<start_of_turn>user\n<tool_response>\n");
+            prompt.push_str(&msg.content);
+            prompt.push_str("\n</tool_response><end_of_turn>\n");
+            continue;
+        }
+
+        let role_name = if msg.role == "assistant" { "model" } else { "user" };
+        prompt.push_str(&format!("<start_of_turn>{role_name}\n"));
+
+        if role_name == "user" && first_user {
+            if let Some(sys) = base_system {
+                prompt.push_str(sys);
+                prompt.push_str("\n\n");
+            }
+            if let Some(tools_json) = tools_array {
+                let clean_tools: Vec<&serde_json::Value> = match tools_json {
+                    serde_json::Value::Array(arr) => arr
+                        .iter()
+                        .map(|t| t.get("function").unwrap_or(t))
+                        .collect(),
+                    _ => vec![tools_json],
+                };
+                let tools_str = serde_json::to_string_pretty(&clean_tools).unwrap_or_default();
+                prompt.push_str("# Available Tools\n\nYou have access to the following tools:\n\n<tools>\n");
+                prompt.push_str(&tools_str);
+                prompt.push_str("\n</tools>\n\nTo call a tool, reply in the following JSON format:\n```json\n{\n  \"name\": \"function_name\",\n  \"arguments\": {\"param_name\": \"param_value\"}\n}\n```\n\nWhen providing the final answer to the user, present your answer directly in markdown and do not call any further tools.\n\n");
+            }
+            first_user = false;
+        }
+
+        if !msg.content.is_empty() {
+            prompt.push_str(&msg.content);
+        }
+
+        if let Some(ref tool_calls) = msg.tool_calls {
+            for tc in tool_calls {
+                let call_obj = serde_json::json!({
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                });
+                prompt.push_str(&format!(
+                    "\n```json\n{}\n```\n",
+                    serde_json::to_string_pretty(&call_obj).unwrap_or_default()
+                ));
+            }
+        }
+
+        prompt.push_str("<end_of_turn>\n");
+    }
+
+    prompt.push_str("<start_of_turn>model\n");
+    prompt
+}
+
+/// Specialized prompt formatting for Mistral, Ministral, Codestral, and NeMo models.
+fn format_mistral_chat_prompt(
+    messages: &[ChatMessage],
+    tools: Option<&serde_json::Value>,
+) -> String {
+    let mut prompt = String::new();
+
+    let tools_array = tools.and_then(|val| match val {
+        serde_json::Value::Array(arr) if !arr.is_empty() => Some(val),
+        _ => None,
+    });
+
+    let system_msg = messages.iter().find(|m| m.role == "system");
+    let base_system = system_msg.map(|m| m.content.as_str());
+
+    prompt.push_str("[INST] ");
+    if let Some(sys) = base_system {
+        prompt.push_str(sys);
+        prompt.push_str("\n\n");
+    }
+
+    if let Some(tools_json) = tools_array {
+        let clean_tools: Vec<&serde_json::Value> = match tools_json {
+            serde_json::Value::Array(arr) => arr
+                .iter()
+                .map(|t| t.get("function").unwrap_or(t))
+                .collect(),
+            _ => vec![tools_json],
+        };
+        let tools_str = serde_json::to_string_pretty(&clean_tools).unwrap_or_default();
+        prompt.push_str("[AVAILABLE_TOOLS] ");
+        prompt.push_str(&tools_str);
+        prompt.push_str(" [/AVAILABLE_TOOLS]\n\n");
+        prompt.push_str("IMPORTANT RULES:\n1. If a function requires parameters that are unknown in the query, call the prerequisite lookup tool FIRST.\n2. NEVER invent or hallucinate coordinates or numerical parameters.\n3. Return function calls strictly inside [TOOL_CALLS] [{\"name\": \"...\", \"arguments\": {...}}] [/TOOL_CALLS]\n4. When you receive [TOOL_RESULTS], summarize the results and answer the user directly. Do NOT repeat previous tool calls.\n\n");
+    }
+
+    let mut inside_inst = true;
+
+    for msg in messages {
+        if msg.role == "system" {
+            continue;
+        }
+
+        match msg.role.as_str() {
+            "user" => {
+                if !inside_inst {
+                    prompt.push_str("[INST] ");
+                }
+                prompt.push_str(&msg.content);
+                prompt.push_str(" [/INST]\n");
+                inside_inst = false;
+            }
+            "tool" => {
+                if !inside_inst {
+                    prompt.push_str("[INST] ");
+                }
+                prompt.push_str("[TOOL_RESULTS] {\"content\": ");
+                if msg.content.starts_with('{') || msg.content.starts_with('[') {
+                    prompt.push_str(&msg.content);
+                } else {
+                    prompt.push_str(&serde_json::to_string(&msg.content).unwrap_or_default());
+                }
+                prompt.push_str("} [/TOOL_RESULTS] [/INST]\n");
+                inside_inst = false;
+            }
+            "assistant" => {
+                if inside_inst {
+                    prompt.push_str(" [/INST]\n");
+                    inside_inst = false;
+                }
+                if let Some(ref tool_calls) = msg.tool_calls {
+                    let mut calls_arr = Vec::new();
+                    for tc in tool_calls {
+                        calls_arr.push(serde_json::json!({
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        }));
+                    }
+                    prompt.push_str(&format!(
+                        "[TOOL_CALLS] {} [/TOOL_CALLS]\n",
+                        serde_json::to_string(&calls_arr).unwrap_or_default()
+                    ));
+                }
+                if !msg.content.is_empty() {
+                    prompt.push_str(&msg.content);
+                    prompt.push_str("\n");
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if inside_inst {
+        prompt.push_str(" [/INST]\n");
+    }
+
+    prompt
+}
+
+/// Strip reasoning / thought blocks (<think>...</think>, <thought>...</thought>, etc.) before parsing tool calls
+fn strip_thought_blocks(text: &str) -> String {
+    let mut result = text.to_string();
+    let thought_patterns = [
+        ("<|channel>thought\n", "<channel|>"),
+        ("<|channel>thought", "<channel|>"),
+        ("<|channel|>thought\n", "<|end|>"),
+        ("<|channel|>thought", "<|end|>"),
+        ("<|channel|>thought\n", "<channel|>"),
+        ("<|channel|>thought", "<channel|>"),
+        ("<|channel|>analysis\n", "<|end|>"),
+        ("<|channel|>analysis", "<|end|>"),
+        ("<thought>", "</thought>"),
+        ("<think>", "</think>"),
+    ];
+
+    for (start_tag, end_tag) in thought_patterns {
+        while let Some(start_idx) = result.find(start_tag) {
+            let after_start = &result[start_idx + start_tag.len()..];
+            if let Some(end_idx) = after_start.find(end_tag) {
+                let full_end_idx = start_idx + start_tag.len() + end_idx + end_tag.len();
+                result.replace_range(start_idx..full_end_idx, "");
+            } else {
+                result.replace_range(start_idx..start_idx + start_tag.len(), "");
+            }
+        }
+    }
+    result
+}
+
+/// Parse tool calls and clean message content from the model's raw generated text.
+pub fn parse_tool_calls(raw_output: &str) -> (String, Option<Vec<ToolCall>>) {
+    let mut tool_calls = Vec::new();
+    // 0. Clean up thought channels first: <think>...</think>, <thought>...</thought>, etc.
+    // This prevents thinking deliberations/hypothetical examples inside <think> from being parsed as real tool calls.
+    let mut cleaned_text = strip_thought_blocks(raw_output);
+
+    // 1. Try parsing GPT-OSS / Harmony tool call syntax:
+    // e.g. "to=functions.<name><|channel|>commentary<|message|>{...}<|call|>"
+    // or "<|start|>assistant to=functions.<name>..."
+    while let Some(to_idx) = cleaned_text.find("to=functions.") {
+        let after_to = &cleaned_text[to_idx + "to=functions.".len()..];
+        let name_end = after_to
+            .find(|c: char| c == '<' || c == ' ' || c == '\n' || c == '{')
+            .unwrap_or(after_to.len());
+        let func_name = after_to[..name_end].trim().to_string();
+
+        let remainder = &after_to[name_end..];
+        let args_start_offset = if let Some(msg_idx) = remainder.find("<|message|>") {
+            Some(msg_idx + "<|message|>".len())
+        } else {
+            remainder.find('{')
+        };
+
+        if !func_name.is_empty() {
+            if let Some(args_offset) = args_start_offset {
+                let args_text = &remainder[args_offset..];
+                let end_tag_offset = args_text
+                    .find("<|call|>")
+                    .or_else(|| args_text.find("<|end|>"))
+                    .or_else(|| args_text.find("<|return|>"));
+
+                let (raw_args, full_match_len) = if let Some(end_o) = end_tag_offset {
+                    (
+                        &args_text[..end_o],
+                        to_idx + "to=functions.".len() + name_end + args_offset + end_o + 8,
+                    )
+                } else if let Some(json_end) = find_matching_brace(args_text) {
+                    (
+                        &args_text[..json_end],
+                        to_idx + "to=functions.".len() + name_end + args_offset + json_end,
+                    )
+                } else {
+                    (args_text.trim(), cleaned_text.len())
+                };
+
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw_args.trim()) {
+                    if val.is_object() {
+                        tool_calls.push(ToolCall {
+                            id: Some(format!("call_{}", uuid_short())),
+                            call_type: Some("function".into()),
+                            function: FunctionCall {
+                                name: func_name,
+                                arguments: val,
+                            },
+                        });
+                        let end_pos = full_match_len.min(cleaned_text.len());
+                        cleaned_text.replace_range(to_idx..end_pos, "");
+                        continue;
+                    }
+                }
+            }
+        }
+        break;
+    }
+
+    // 2. Try parsing Gemma / standard call syntax: <|tool_call>call:name{...}<tool_call|> or call:name{...}
+    let gemma_markers = [
+        ("<|tool_call>call:", "<tool_call|>"),
+        ("<tool_call>call:", "</tool_call>"),
+        ("<|tool_call>call:", "<|end|>"),
+    ];
+
+    for (start_tag, end_tag) in gemma_markers {
+        while let Some(start_idx) = cleaned_text.find(start_tag) {
+            let after_start = &cleaned_text[start_idx + start_tag.len()..];
+            if let Some(end_idx) = after_start.find(end_tag) {
+                let call_str = &after_start[..end_idx];
+                if let Some((name, args_val)) = parse_gemma_call(call_str) {
+                    tool_calls.push(ToolCall {
+                        id: Some(format!("call_{}", uuid_short())),
+                        call_type: Some("function".into()),
+                        function: FunctionCall {
+                            name,
+                            arguments: args_val,
+                        },
+                    });
+                }
+                let full_end_idx = start_idx + start_tag.len() + end_idx + end_tag.len();
+                cleaned_text.replace_range(start_idx..full_end_idx, "");
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Fallback: search for un-tagged `call:func_name{...}` anywhere in text
+    while let Some(call_idx) = cleaned_text.find("call:") {
+        let after_call = &cleaned_text[call_idx + 5..];
+        if let Some(end_brace) = find_matching_brace(after_call) {
+            let call_str = &after_call[..end_brace];
+            if let Some((name, args_val)) = parse_gemma_call(call_str) {
+                tool_calls.push(ToolCall {
+                    id: Some(format!("call_{}", uuid_short())),
+                    call_type: Some("function".into()),
+                    function: FunctionCall {
+                        name,
+                        arguments: args_val,
+                    },
+                });
+                cleaned_text.replace_range(call_idx..call_idx + 5 + end_brace, "");
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 3. Try parsing Qwen 3.8 XML syntax:
+    // <tool_call>
+    // <function=name>
+    // <parameter=key>value</parameter>
+    // </function>
+    // </tool_call>
+    while let Some(start_idx) = cleaned_text.find("<function=") {
+        let after_func = &cleaned_text[start_idx + "<function=".len()..];
+        if let Some(func_name_end) = after_func.find('>') {
+            let func_name = after_func[..func_name_end].trim().to_string();
+            let remainder = &after_func[func_name_end + 1..];
+            
+            let func_end_idx = remainder.find("</function>").unwrap_or(remainder.len());
+            let func_body = &remainder[..func_end_idx];
+
+            let mut arguments = serde_json::Map::new();
+            let mut param_search = func_body;
+            while let Some(p_start) = param_search.find("<parameter=") {
+                let after_p = &param_search[p_start + "<parameter=".len()..];
+                if let Some(p_name_end) = after_p.find('>') {
+                    let p_name = after_p[..p_name_end].trim().to_string();
+                    let p_val_after = &after_p[p_name_end + 1..];
+                    if let Some(p_val_end) = p_val_after.find("</parameter>") {
+                        let p_val_raw = p_val_after[..p_val_end].trim();
+                        if let Ok(json_val) = serde_json::from_str::<serde_json::Value>(p_val_raw) {
+                            arguments.insert(p_name, json_val);
+                        } else {
+                            arguments.insert(p_name, serde_json::Value::String(p_val_raw.to_string()));
+                        }
+                        param_search = &p_val_after[p_val_end + "</parameter>".len()..];
+                        continue;
+                    }
+                }
+                break;
+            }
+
+            tool_calls.push(ToolCall {
+                id: Some(format!("call_{}", uuid_short())),
+                call_type: Some("function".into()),
+                function: FunctionCall {
+                    name: func_name,
+                    arguments: serde_json::Value::Object(arguments),
+                },
+            });
+
+            // Clean up surrounding tags if present
+            let full_start = if let Some(tc_open) = cleaned_text[..start_idx].rfind("<tool_call>") {
+                let between = &cleaned_text[tc_open + "<tool_call>".len()..start_idx];
+                if between.trim().is_empty() {
+                    tc_open
+                } else {
+                    start_idx
+                }
+            } else {
+                start_idx
+            };
+            let end_offset = start_idx + "<function=".len() + func_name_end + 1 + func_end_idx + "</function>".len();
+            let full_end = if let Some(tc_close) = cleaned_text[end_offset..].find("</tool_call>") {
+                end_offset + tc_close + "</tool_call>".len()
+            } else {
+                end_offset
+            };
+            cleaned_text.replace_range(full_start..full_end.min(cleaned_text.len()), "");
+        } else {
+            break;
+        }
+    }
+
+    let json_markers = [
+        ("<tool_call>", "</tool_call>"),
+        ("<|tool_call|>", "<|tool_call|>"),
+        ("<|tool_call>", "<tool_call|>"),
+        ("<toolcall>", "</toolcall>"),
+        ("```tool_call", "```"),
+        ("[TOOL_CALLS]", "[/TOOL_CALLS]"),
+    ];
+
+    for (start_tag, end_tag) in json_markers {
+        while let Some(start_idx) = cleaned_text.find(start_tag) {
+            let after_start = &cleaned_text[start_idx + start_tag.len()..];
+            let found_end = after_start.find(end_tag).map(|idx| (idx, end_tag.len())).or_else(|| {
+                if start_tag == "<tool_call>" {
+                    // Handle typos emitted by local models e.g. </tool__call> or unclosed tag with valid JSON
+                    after_start.find("</tool__call>").map(|idx| (idx, "</tool__call>".len()))
+                        .or_else(|| after_start.find("</toolcall>").map(|idx| (idx, "</toolcall>".len())))
+                        .or_else(|| find_matching_brace(after_start).map(|idx| (idx, 0)))
+                } else if start_tag == "<|tool_call|>" || start_tag == "<|tool_call>" {
+                    after_start.find("<|im_end|>").map(|idx| (idx, 0))
+                        .or_else(|| after_start.find("\n\n").map(|idx| (idx, 0)))
+                } else {
+                    None
+                }
+            });
+
+            if let Some((end_idx, matched_end_len)) = found_end {
+                let raw_inner = after_start[..end_idx].trim();
+                // Strip corrupted internal tags that models occasionally emit e.g. </arg_value>, </arg_name>, etc.
+                let inner_clean = if let Some(brace_start) = raw_inner.find('{') {
+                    let from_brace = &raw_inner[brace_start..];
+                    if let Some(brace_len) = find_matching_brace(from_brace) {
+                        &from_brace[..brace_len]
+                    } else {
+                        raw_inner
+                    }
+                } else {
+                    raw_inner
+                };
+
+                if let Some(tc) = parse_json_tool_call(inner_clean) {
+                    tool_calls.push(tc);
+                } else if let Ok(val) = serde_json::from_str::<serde_json::Value>(inner_clean) {
+                    if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if let Some(tc) = parse_json_tool_call(&item.to_string()) {
+                                tool_calls.push(tc);
+                            }
+                        }
+                    }
+                }
+                let full_end_idx = start_idx + start_tag.len() + end_idx + matched_end_len;
+                cleaned_text.replace_range(start_idx..full_end_idx, "");
+            } else {
+                break;
+            }
+        }
+    }
+
+    // 4. Try parsing un-tagged [TOOL_CALLS] [...] syntax (e.g. Mistral v3 without end tag)
+    while let Some(tc_idx) = cleaned_text.find("[TOOL_CALLS]") {
+        let after_tc = &cleaned_text[tc_idx + "[TOOL_CALLS]".len()..];
+        let trimmed_after = after_tc.trim_start();
+        if trimmed_after.starts_with('[') {
+            if let Some(bracket_len) = find_matching_bracket(trimmed_after) {
+                let candidate = &trimmed_after[..bracket_len];
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+                    if let Some(arr) = val.as_array() {
+                        for item in arr {
+                            if let Some(tc) = parse_json_tool_call(&item.to_string()) {
+                                tool_calls.push(tc);
+                            }
+                        }
+                    }
+                }
+                let full_end = tc_idx + "[TOOL_CALLS]".len() + (after_tc.len() - trimmed_after.len()) + bracket_len;
+                cleaned_text.replace_range(tc_idx..full_end, "");
+                continue;
+            }
+        } else if trimmed_after.starts_with('{') {
+            if let Some(brace_len) = find_matching_brace(trimmed_after) {
+                let candidate = &trimmed_after[..brace_len];
+                if let Some(tc) = parse_json_tool_call(candidate) {
+                    tool_calls.push(tc);
+                }
+                let full_end = tc_idx + "[TOOL_CALLS]".len() + (after_tc.len() - trimmed_after.len()) + brace_len;
+                cleaned_text.replace_range(tc_idx..full_end, "");
+                continue;
+            }
+        }
+        break;
+    }
+
+    // 5. Try parsing raw JSON tool calls: arrays [ {...}, ... ] or individual objects { "name": ... }
+    let mut search_idx = 0;
+    while search_idx < cleaned_text.len() {
+        if let Some(arr_start) = cleaned_text[search_idx..].find('[') {
+            let actual_start = search_idx + arr_start;
+            let from_bracket = &cleaned_text[actual_start..];
+            if let Some(bracket_len) = find_matching_bracket(from_bracket) {
+                let candidate = &from_bracket[..bracket_len];
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(candidate) {
+                    if let Some(arr) = val.as_array() {
+                        let mut parsed = Vec::new();
+                        for item in arr {
+                            if let Some(tc) = parse_json_tool_call(&item.to_string()) {
+                                parsed.push(tc);
+                            } else {
+                                parsed.clear();
+                                break;
+                            }
+                        }
+                        if !parsed.is_empty() {
+                            tool_calls.extend(parsed);
+                            cleaned_text.replace_range(actual_start..actual_start + bracket_len, "");
+                            continue;
+                        }
+                    }
+                }
+                search_idx = actual_start + 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    let mut obj_search_idx = 0;
+    while obj_search_idx < cleaned_text.len() {
+        if let Some(brace_start) = cleaned_text[obj_search_idx..].find('{') {
+            let actual_start = obj_search_idx + brace_start;
+            let from_brace = &cleaned_text[actual_start..];
+            if let Some(brace_len) = find_matching_brace(from_brace) {
+                let candidate = &from_brace[..brace_len];
+                if let Some(tc) = parse_json_tool_call(candidate) {
+                    tool_calls.push(tc);
+                    cleaned_text.replace_range(actual_start..actual_start + brace_len, "");
+                    continue;
+                }
+                obj_search_idx = actual_start + 1;
+            } else {
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    // 6. Clean up thought channels if present: <|channel>thought\n...<channel|> or <thought>...</thought> or <think>...</think>
+    cleaned_text = strip_channel_tags(&cleaned_text);
+
+    let final_tool_calls = if tool_calls.is_empty() {
+        None
+    } else {
+        Some(tool_calls)
+    };
+
+    let trimmed = cleaned_text.trim().to_string();
+
+    (trimmed, final_tool_calls)
+}
+
+/// Helper: parse Gemma 4 `function_name{param:<|"|>val<|"|>}` or `function_name{param: "val"}`
+fn parse_gemma_call(call_str: &str) -> Option<(String, serde_json::Value)> {
+    let brace_idx = call_str.find('{')?;
+    let func_name = call_str[..brace_idx].trim().to_string();
+    if func_name.is_empty() {
+        return None;
+    }
+
+    let args_slice = call_str[brace_idx..].trim();
+    // Normalize Gemma 4 custom quotes <|"|> into standard double quotes "
+    let normalized = args_slice.replace("<|\"|>", "\"");
+
+    // Attempt direct JSON parse
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&normalized) {
+        if val.is_object() {
+            return Some((func_name, val));
+        }
+    }
+
+    // If direct parse fails, try quoting unquoted keys: {key: "val"} -> {"key": "val"}
+    let fixed_json = quote_unquoted_keys(&normalized);
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&fixed_json) {
+        if val.is_object() {
+            return Some((func_name, val));
+        }
+    }
+
+    // Fallback: manual key-value parser for simple {key: "val", key2: 123}
+    let manual_map = parse_simple_kv(&normalized);
+    Some((func_name, serde_json::Value::Object(manual_map)))
+}
+
+/// Helper: parse a JSON block containing tool call object
+fn parse_json_tool_call(json_str: &str) -> Option<ToolCall> {
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
+        // Direct object: {"name": "...", "arguments": ...}
+        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
+            let arguments = match val.get("arguments") {
+                Some(serde_json::Value::String(s)) => {
+                    serde_json::from_str(s).unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+                }
+                Some(obj @ serde_json::Value::Object(_)) => obj.clone(),
+                _ => serde_json::Value::Object(serde_json::Map::new()),
+            };
+            return Some(ToolCall {
+                id: Some(format!("call_{}", uuid_short())),
+                call_type: Some("function".into()),
+                function: FunctionCall {
+                    name: name.to_string(),
+                    arguments,
+                },
+            });
+        }
+
+        // Nested in "function": {"function": {"name": "...", "arguments": ...}}
+        if let Some(func_obj) = val.get("function") {
+            if let Some(name) = func_obj.get("name").and_then(|n| n.as_str()) {
+                let arguments = match func_obj.get("arguments") {
+                    Some(serde_json::Value::String(s)) => {
+                        serde_json::from_str(s).unwrap_or(serde_json::Value::Object(serde_json::Map::new()))
+                    }
+                    Some(obj @ serde_json::Value::Object(_)) => obj.clone(),
+                    _ => serde_json::Value::Object(serde_json::Map::new()),
+                };
+                return Some(ToolCall {
+                    id: Some(format!("call_{}", uuid_short())),
+                    call_type: Some("function".into()),
+                    function: FunctionCall {
+                        name: name.to_string(),
+                        arguments,
+                    },
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Convert unquoted keys `{foo: "bar"}` to `{"foo": "bar"}`
+fn quote_unquoted_keys(input: &str) -> String {
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut chars = input.chars().peekable();
+    let mut in_string = false;
+    let mut escape = false;
+
+    while let Some(c) = chars.next() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            out.push(c);
+        } else {
+            if c == '"' {
+                in_string = true;
+                out.push(c);
+            } else if c.is_alphabetic() || c == '_' {
+                // Potential unquoted key
+                let mut ident = String::new();
+                ident.push(c);
+                while let Some(&next_c) = chars.peek() {
+                    if next_c.is_alphanumeric() || next_c == '_' {
+                        ident.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                // Check if followed by ':'
+                let mut ws = String::new();
+                while let Some(&next_c) = chars.peek() {
+                    if next_c.is_whitespace() {
+                        ws.push(chars.next().unwrap());
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&':') = chars.peek() {
+                    out.push('"');
+                    out.push_str(&ident);
+                    out.push('"');
+                    out.push_str(&ws);
+                } else {
+                    out.push_str(&ident);
+                    out.push_str(&ws);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Fallback manual key-value parser
+fn parse_simple_kv(input: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut map = serde_json::Map::new();
+    let trimmed = input.trim_matches(|c| c == '{' || c == '}');
+    for pair in trimmed.split(',') {
+        if let Some((k, v)) = pair.split_once(':') {
+            let key = k.trim().trim_matches('"').to_string();
+            let raw_val = v.trim().trim_matches('"');
+            if let Ok(num) = raw_val.parse::<i64>() {
+                map.insert(key, serde_json::Value::Number(num.into()));
+            } else if let Ok(b) = raw_val.parse::<bool>() {
+                map.insert(key, serde_json::Value::Bool(b));
+            } else {
+                map.insert(key, serde_json::Value::String(raw_val.to_string()));
+            }
+        }
+    }
+    map
+}
+
+/// Helper: find matching closing bracket `]` accounting for strings and nesting
+fn find_matching_bracket(s: &str) -> Option<usize> {
+    let start = s.find('[')?;
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, c) in s[start..].char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '[' {
+            depth += 1;
+        } else if c == ']' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Helper: find matching closing brace `}` accounting for strings and nesting
+fn find_matching_brace(s: &str) -> Option<usize> {
+    let start = s.find('{')?;
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape = false;
+
+    for (i, c) in s[start..].char_indices() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if c == '\\' {
+            escape = true;
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+            continue;
+        }
+        if in_string {
+            continue;
+        }
+        if c == '{' {
+            depth += 1;
+        } else if c == '}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(start + i + 1);
+            }
+        }
+    }
+    None
+}
+
+/// Strip thought channels and special control tags from model output
+fn strip_channel_tags(text: &str) -> String {
+    let mut result = text.to_string();
+
+    let channel_patterns = [
+        ("to=self<|message|>", "<|eom|>"),
+        ("to=self<|message|>", "<|eot|>"),
+        ("to=self<|message|>", "<|start|>"),
+        ("<|start|>assistant to=self<|message|>", "<|eom|>"),
+        ("<|start|>assistant to=self<|message|>", "<|eot|>"),
+        ("<|start|>assistant to=self<|message|>", "<|start|>"),
+        ("<|channel>thought\n", "<channel|>"),
+        ("<|channel>thought", "<channel|>"),
+        ("<|channel|>thought\n", "<|end|>"),
+        ("<|channel|>thought", "<|end|>"),
+        ("<|channel|>thought\n", "<channel|>"),
+        ("<|channel|>thought", "<channel|>"),
+        ("<|channel|>analysis\n", "<|end|>"),
+        ("<|channel|>analysis", "<|end|>"),
+        ("<|channel|>commentary\n", "<|end|>"),
+        ("<|channel|>commentary", "<|end|>"),
+        ("<thought>", "</thought>"),
+        ("<think>", "</think>"),
+    ];
+
+    for (start_tag, end_tag) in channel_patterns {
+        while let Some(start_idx) = result.find(start_tag) {
+            let after_start = &result[start_idx + start_tag.len()..];
+            if let Some(end_idx) = after_start.find(end_tag) {
+                let full_end_idx = start_idx + start_tag.len() + end_idx + end_tag.len();
+                result.replace_range(start_idx..full_end_idx, "");
+            } else {
+                result.replace_range(start_idx..start_idx + start_tag.len(), "");
+            }
+        }
+    }
+
+    // Strip remaining to=<recipient><|message|> or to=<recipient>\n headers
+    while let Some(to_idx) = result.find("to=") {
+        let after_to = &result[to_idx..];
+        if let Some(msg_idx) = after_to.find("<|message|>") {
+            let full_end = to_idx + msg_idx + "<|message|>".len();
+            result.replace_range(to_idx..full_end, "");
+        } else if let Some(nl_idx) = after_to.find('\n') {
+            let full_end = to_idx + nl_idx + 1;
+            result.replace_range(to_idx..full_end, "");
+        } else {
+            result.replace_range(to_idx..result.len(), "");
+        }
+    }
+
+    // Clean stray tokens
+    let stray_tokens = [
+        "<|channel|>final<|message|>",
+        "<|channel|>final",
+        "<|channel>thought",
+        "<channel|>",
+        "<turn|>",
+        "<|turn|>",
+        "<start_of_turn>model",
+        "<start_of_turn>user",
+        "<start_of_turn>",
+        "<end_of_turn>",
+        "<|start|>assistant",
+        "<|start|>",
+        "<|end|>",
+        "<|return|>",
+        "<|call|>",
+        "<|message|>",
+        "<|header_start|>assistant<|header_end|>",
+        "<|header_start|>",
+        "<|header_end|>",
+        "<|eot|>",
+        "<|im_start|>assistant",
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|start_of_role|>system<|end_of_role|>",
+        "<|start_of_role|>assistant<|end_of_role|>",
+        "<|start_of_role|>user<|end_of_role|>",
+        "<|start_of_role|>tool_response<|end_of_role|>",
+        "<|start_of_role|>tools<|end_of_role|>",
+        "<|start_of_role|>",
+        "<|end_of_role|>",
+        "<|end_of_text|>",
+        "<|end_of_turn|>",
+        "to=user",
+        "to=self",
+        "<atem:function_calls>",
+        "</atem:function_calls>",
+        "[INST]",
+        "[/INST]",
+        "[AVAILABLE_TOOLS]",
+        "[/AVAILABLE_TOOLS]",
+        "[TOOL_RESULTS]",
+        "[/TOOL_RESULTS]",
+        "<s>",
+        "</s>",
+    ];
+
+    for tok in stray_tokens {
+        result = result.replace(tok, "");
+    }
+
+    result
+}
+
+
+
+fn uuid_short() -> String {
+    use std::time::SystemTime;
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    format!("{:08x}", nanos)
+}
+
+
+
+
+
+
+
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_gptoss_tool_call() {
+        let raw = "<|channel|>thought\nNeed station data\n<|end|><|start|>assistant to=functions.get_station_data<|channel|>commentary<|message|>{\"station_id\": 104, \"sensor\": \"temperature\"}<|call|>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "get_station_data");
+        assert_eq!(
+            tcs[0].function.arguments["station_id"],
+            serde_json::json!(104)
+        );
+        assert_eq!(
+            tcs[0].function.arguments["sensor"],
+            serde_json::json!("temperature")
+        );
+    }
+
+    #[test]
+    fn test_parse_gemma4_tool_call() {
+        let raw = "<|channel>thought\nNeed to get weather for Paris\n<channel|><|tool_call>call:get_current_weather{location:<|\"|>Paris<|\"|>,unit:<|\"|>celsius<|\"|>}<tool_call|>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "get_current_weather");
+        assert_eq!(
+            tcs[0].function.arguments["location"],
+            serde_json::json!("Paris")
+        );
+        assert_eq!(
+            tcs[0].function.arguments["unit"],
+            serde_json::json!("celsius")
+        );
+    }
+
+    #[test]
+    fn test_parse_special_pipe_tool_call() {
+        let raw = "<|tool_call|>\n{\"name\": \"getgroupid\", \"arguments\": {}}<|im_end|>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "getgroupid");
+    }
+
+    #[test]
+    fn test_parse_corrupted_closing_tag() {
+        let raw = "<tool_call>\n{\"name\": \"getgroupid\", \"arguments\": {}}\n</tool__call>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "getgroupid");
+    }
+
+    #[test]
+    fn test_parse_json_tool_call() {
+        let raw = "Let me check that for you.\n<tool_call>\n{\"name\": \"calculator\", \"arguments\": {\"expression\": \"2+2\"}}\n</tool_call>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "Let me check that for you.");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs[0].function.name, "calculator");
+        assert_eq!(tcs[0].function.arguments["expression"], serde_json::json!("2+2"));
+    }
+
+    #[test]
+    fn test_parse_mistral_tool_call() {
+        let raw = "[TOOL_CALLS] [{\"name\": \"get_current_weather\", \"arguments\": {\"location\": \"Tokyo\"}}]";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "get_current_weather");
+        assert_eq!(tcs[0].function.arguments["location"], serde_json::json!("Tokyo"));
+    }
+
+    #[test]
+    fn test_parse_qwen38_xml_tool_call() {
+        let raw = "<think>\nThinking about weather...\n</think>\n<tool_call>\n<function=get_forecast>\n<parameter=location>\nGraz, Austria\n</parameter>\n<parameter=hours>\n12\n</parameter>\n</function>\n</tool_call>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "get_forecast");
+        assert_eq!(tcs[0].function.arguments["location"], serde_json::json!("Graz, Austria"));
+        assert_eq!(tcs[0].function.arguments["hours"], serde_json::json!(12));
+    }
+
+    #[test]
+    fn test_parse_tool_call_with_thinking_cross_contamination() {
+        let raw = "<think>\nWait, the prompt shows \n<tool_call>\n<function=get_devices_around_position>... twice? ... I'll just make one tool call properly: <function=get_coordinates><parameter=location>Göttingen</parameter></function>\n</think>\n\n<tool_call>\n<function=get_coordinates>\n<parameter=location>\nGöttingen\n</parameter>\n</function>\n</tool_call>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "get_coordinates");
+        assert_eq!(tcs[0].function.arguments["location"], serde_json::json!("Göttingen"));
+    }
+
+    #[test]
+    fn test_format_chat_prompt_with_tools() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "What is 2+2?".into(),
+            tool_calls: None,
+        }];
+        let tools = serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "calc",
+                    "description": "Evaluate math expression"
+                }
+            }
+        ]);
+        let prompt = format_chat_prompt(&messages, Some(&tools), None);
+        assert!(prompt.contains("# Tools"));
+        assert!(prompt.contains("\"name\": \"calc\""));
+        assert!(prompt.contains("<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n"));
+
+        let gpt_prompt = format_chat_prompt(&messages, Some(&tools), Some("gptoss"));
+        assert!(gpt_prompt.contains("<|start|>system<|message|>"));
+        assert!(gpt_prompt.contains("to=functions.<function_name>"));
+        assert!(gpt_prompt.contains("<|start|>user<|message|>What is 2+2?<|end|>"));
+        assert!(gpt_prompt.ends_with("<|start|>assistant"));
+
+        let mistral_prompt = format_chat_prompt(&messages, Some(&tools), Some("mistral"));
+        assert!(mistral_prompt.contains("[INST]"));
+        assert!(mistral_prompt.contains("[AVAILABLE_TOOLS]"));
+        assert!(mistral_prompt.contains("[/INST]"));
+
+        let granite_prompt = format_chat_prompt(&messages, Some(&tools), Some("granite"));
+        assert!(granite_prompt.contains("<|start_of_role|>system<|end_of_role|>"));
+        assert!(granite_prompt.contains("<|start_of_role|>user<|end_of_role|>What is 2+2?<|end_of_text|>"));
+        assert!(granite_prompt.ends_with("<|start_of_role|>assistant<|end_of_role|>"));
+    }
+
+    #[test]
+    fn test_qwen_tool_response_no_forced_think() {
+        let messages = vec![
+            ChatMessage {
+                role: "user".into(),
+                content: "get temperature".into(),
+                tool_calls: None,
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                content: String::new(),
+                tool_calls: Some(vec![ToolCall {
+                    id: Some("call_1".into()),
+                    call_type: Some("function".into()),
+                    function: FunctionCall {
+                        name: "weathertool".into(),
+                        arguments: serde_json::json!({}),
+                    },
+                }]),
+            },
+            ChatMessage {
+                role: "tool".into(),
+                content: "[{\"station\": \"A\", \"temp\": -5}]".into(),
+                tool_calls: None,
+            },
+        ];
+        let prompt = format_chat_prompt(&messages, None, Some("qwen"));
+        assert!(!prompt.contains("<think>\n\n</think>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn test_parse_glm_tool_call_with_corrupted_trailing_tag() {
+        let raw = "<tool_call>{\"name\": \"get_devices_around_position\", \"arguments\": {\"place\": \"Göttingen, Germany\", \"km\": 20}}</arg_value></tool_call>";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 1);
+        assert_eq!(tcs[0].function.name, "get_devices_around_position");
+        assert_eq!(tcs[0].function.arguments["place"], serde_json::json!("Göttingen, Germany"));
+        assert_eq!(tcs[0].function.arguments["km"], serde_json::json!(20));
+    }
+
+    #[test]
+    fn test_parse_ministral_multiple_raw_arrays() {
+        let raw = "[\n  {\n    \"name\": \"get_devices_by_name\",\n    \"arguments\": {\n      \"dluName\": \"Lengden\",\n      \"fields\": \"id,name,channels\"\n    }\n  }\n][\n  {\n    \"name\": \"get_excel_measurement_data_by_name\",\n    \"arguments\": {\n      \"dluName\": \"Lengden\",\n      \"channels\": \"ALL\",\n      \"hour\": 12,\n      \"fileName\": \"Lengden_Weather_Data\"\n    }\n  }\n]Here is the Excel file";
+        let (content, tool_calls) = parse_tool_calls(raw);
+        assert_eq!(content, "Here is the Excel file");
+        assert!(tool_calls.is_some());
+        let tcs = tool_calls.unwrap();
+        assert_eq!(tcs.len(), 2);
+        assert_eq!(tcs[0].function.name, "get_devices_by_name");
+        assert_eq!(tcs[0].function.arguments["dluName"], serde_json::json!("Lengden"));
+        assert_eq!(tcs[1].function.name, "get_excel_measurement_data_by_name");
+        assert_eq!(tcs[1].function.arguments["hour"], serde_json::json!(12));
+    }
+
+    #[test]
+    fn test_format_gemma_chat_prompt() {
+        let messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "Hello".into(),
+            tool_calls: None,
+        }];
+        let tools = serde_json::json!([{
+            "name": "get_weather",
+            "description": "Fetch weather",
+            "parameters": {}
+        }]);
+        let prompt = format_chat_prompt(&messages, Some(&tools), Some("gemma4-26b"));
+        assert!(prompt.contains("<start_of_turn>user"));
+        assert!(prompt.contains("# Available Tools"));
+        assert!(prompt.contains("<end_of_turn>"));
+        assert!(prompt.ends_with("<start_of_turn>model\n"));
+    }
 }

@@ -83,38 +83,120 @@ pub fn ndjson_chat_stream(
     let (tx, rx) = mpsc::channel::<Result<String, std::io::Error>>(64);
 
     tokio::spawn(async move {
+        let mut full_response = String::new();
+        let mut prefix_buffer = String::new();
+        let mut is_tool_call = false;
+        let mut prefix_checked = false;
+
         while let Some(token) = token_rx.recv().await {
-            let chunk = ChatResponseChunk {
-                model: model_name.clone(),
-                created_at: now_rfc3339(),
-                message: ChatMessage {
-                    role: "assistant".into(),
-                    content: token.text,
-                },
-                done: false,
-                done_reason: None,
-                total_duration: None,
-                load_duration: None,
-                prompt_eval_count: None,
-                prompt_eval_duration: None,
-                eval_count: None,
-                eval_duration: None,
-            };
-            let mut line = serde_json::to_string(&chunk).unwrap_or_default();
-            line.push('\n');
-            if tx.send(Ok(line)).await.is_err() {
-                return;
+            full_response.push_str(&token.text);
+
+            if !prefix_checked {
+                prefix_buffer.push_str(&token.text);
+                let trimmed = prefix_buffer.trim_start();
+
+                // 1. Strip thought channels like <|channel>thought\n...<channel|> or <thought>...</thought> or <think>...</think>
+                if trimmed.starts_with("<|channel>thought")
+                    || trimmed.starts_with("<thought>")
+                    || trimmed.starts_with("<think>")
+                {
+                    if let Some(end_idx) = trimmed
+                        .find("<channel|>")
+                        .map(|i| i + "<channel|>".len())
+                        .or_else(|| trimmed.find("</thought>").map(|i| i + "</thought>".len()))
+                        .or_else(|| trimmed.find("</think>").map(|i| i + "</think>".len()))
+                    {
+                        prefix_buffer = trimmed[end_idx..].trim_start().to_string();
+                    } else {
+                        // Still inside thought channel, continue buffering
+                        continue;
+                    }
+                }
+
+                let trimmed = prefix_buffer.trim_start();
+
+                // 2. Detect tool calls or reasoning channels early to prevent streaming raw JSON/reasoning to UI
+                if trimmed.starts_with("<tool_call")
+                    || trimmed.starts_with("<|tool_call")
+                    || trimmed.starts_with("```tool_call")
+                    || trimmed.starts_with("```json")
+                    || trimmed.starts_with("<atem:function_calls")
+                    || trimmed.starts_with("to=functions.")
+                    || trimmed.starts_with("[TOOL_CALLS]")
+                    || (trimmed.starts_with('{') && (trimmed.contains("\"name\"") || trimmed.contains("\"function\"") || trimmed.contains("\"arguments\"")))
+                    || (trimmed.starts_with('[') && trimmed.contains("\"name\""))
+                    || trimmed.starts_with("call:")
+                    || (trimmed.starts_with("to=") && !trimmed.starts_with("to=user"))
+                    || (trimmed.starts_with("<|start|>assistant to=")
+                        && !trimmed.starts_with("<|start|>assistant to=user"))
+                {
+                    is_tool_call = true;
+                    prefix_checked = true;
+                    continue;
+                }
+
+                // 3. Strip Harmony channel headers like `to=user<|message|>` or `to=user\n`
+                if let Some(msg_idx) = trimmed.find("<|message|>") {
+                    let user_text = &trimmed[msg_idx + "<|message|>".len()..];
+                    if !user_text.is_empty() {
+                        let chunk = make_chat_chunk(&model_name, user_text.to_string(), false);
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                    prefix_checked = true;
+                    continue;
+                }
+
+                if trimmed.starts_with("to=user\n") {
+                    let user_text = &trimmed["to=user\n".len()..];
+                    if !user_text.is_empty() {
+                        let chunk = make_chat_chunk(&model_name, user_text.to_string(), false);
+                        if tx.send(Ok(chunk)).await.is_err() {
+                            return;
+                        }
+                    }
+                    prefix_checked = true;
+                    continue;
+                }
+
+                // If not matching any known protocol prefix, flush buffer and stream normally
+                if prefix_buffer.len() > 30
+                    || (!trimmed.starts_with("to=")
+                        && !trimmed.starts_with("<|")
+                        && !trimmed.starts_with("<tool")
+                        && !trimmed.starts_with('{')
+                        && !trimmed.starts_with('['))
+                {
+                    let chunk = make_chat_chunk(&model_name, prefix_buffer.clone(), false);
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        return;
+                    }
+                    prefix_checked = true;
+                }
+                continue;
+            }
+
+            if !is_tool_call {
+                let chunk = make_chat_chunk(&model_name, token.text, false);
+                if tx.send(Ok(chunk)).await.is_err() {
+                    return;
+                }
             }
         }
 
         let total_ns = request_start.elapsed().as_nanos() as u64;
         let result = result_rx.await.ok();
+        tracing::info!("STREAM CHAT RAW RESPONSE: {:?}", full_response);
+        let (cleaned_content, tool_calls) = crate::server::chat::parse_tool_calls(&full_response);
+        tracing::info!("STREAM PARSED TOOL CALLS: {:?}, CLEANED CONTENT: {:?}", tool_calls, cleaned_content);
         let final_chunk = ChatResponseChunk {
             model: model_name,
             created_at: now_rfc3339(),
             message: ChatMessage {
                 role: "assistant".into(),
                 content: String::new(),
+                tool_calls,
             },
             done: true,
             done_reason: Some("stop".into()),
@@ -139,4 +221,27 @@ pub fn ndjson_chat_stream(
     });
 
     Body::from_stream(ReceiverStream::new(rx))
+}
+
+fn make_chat_chunk(model_name: &str, content: String, done: bool) -> String {
+    let chunk = ChatResponseChunk {
+        model: model_name.to_string(),
+        created_at: now_rfc3339(),
+        message: ChatMessage {
+            role: "assistant".into(),
+            content,
+            tool_calls: None,
+        },
+        done,
+        done_reason: None,
+        total_duration: None,
+        load_duration: None,
+        prompt_eval_count: None,
+        prompt_eval_duration: None,
+        eval_count: None,
+        eval_duration: None,
+    };
+    let mut line = serde_json::to_string(&chunk).unwrap_or_default();
+    line.push('\n');
+    line
 }

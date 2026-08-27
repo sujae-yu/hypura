@@ -28,7 +28,29 @@ pub struct ChatRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
+    #[serde(default)]
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolCall {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", default = "default_function_type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    pub function: FunctionCall,
+}
+
+fn default_function_type() -> Option<String> {
+    Some("function".into())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FunctionCall {
+    pub name: String,
+    pub arguments: serde_json::Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -36,8 +58,12 @@ pub struct GenerateOptions {
     pub temperature: Option<f32>,
     pub top_k: Option<i32>,
     pub top_p: Option<f32>,
+    pub repeat_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
     pub num_predict: Option<u32>,
+    pub num_ctx: Option<u32>,
     pub seed: Option<u32>,
+    pub stop: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,12 +130,29 @@ pub struct ModelTag {
     pub details: ModelDetails,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ModelDetails {
     pub format: String,
     pub family: String,
     pub parameter_size: String,
     pub quantization_level: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PsResponse {
+    pub models: Vec<ProcessModel>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProcessModel {
+    pub name: String,
+    pub model: String,
+    pub size: u64,
+    pub digest: String,
+    pub details: ModelDetails,
+    pub expires_at: String,
+    pub size_vram: u64,
+    pub context_size: u32,
 }
 
 #[derive(Debug, Serialize)]

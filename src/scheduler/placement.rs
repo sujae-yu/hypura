@@ -10,7 +10,7 @@ use crate::scheduler::prefetch::build_prefetch_schedule;
 use crate::scheduler::types::*;
 
 const OS_OVERHEAD: u64 = 2 * (1 << 30); // 2 GiB reserved for macOS
-const GPU_RUNTIME_OVERHEAD: u64 = 1 << 30; // 1 GiB reserved for compute buffers + Metal overhead (actual usage ~362 MiB)
+const GPU_RUNTIME_OVERHEAD: u64 = 3800 * 1024 * 1024; // 3.8 GiB reserved for compute buffers, graph splits + Metal overhead
 const SYNC_OVERHEAD_PER_LAYER_US: f64 = 50.0; // 50μs CPU-GPU sync per layer
 const MOE_CACHE_HIT_RATE: f64 = 0.965; // From PowerInfer-2, matches estimator.rs
 
@@ -30,12 +30,10 @@ pub fn compute_placement_with_context(
     context_length: u32,
 ) -> anyhow::Result<PlacementPlan> {
     let metadata = ModelMetadata::from_gguf(model)?;
-    // Cap KV headroom context — the model's max context (e.g., 131K) is the ceiling,
-    // not the operating point. Use a practical default for placement planning.
     let context_length = if context_length > 0 {
         context_length.min(metadata.context_length.max(2048))
     } else {
-        metadata.context_length.max(2048).min(8192)
+        8192.min(metadata.context_length.max(2048))
     };
     let capacities = compute_tier_capacities(hardware, &metadata, context_length);
 
@@ -141,13 +139,29 @@ fn compute_tier_capacities(
     let gpu_max = hw.gpu.as_ref().map_or(0, |g| g.vram_bytes);
 
     // Reserve space for KV cache and GPU runtime (compute buffers, Metal overhead).
-    // On unified memory (Apple Silicon), KV cache + compute live in the same
-    // working set as model weights — must subtract from gpu_bytes too.
+    // On unified memory (Apple Silicon), total RAM is shared between GPU and CPU,
+    // but Metal imposes a hard process limit (recommendedMaxWorkingSetSize, e.g. ~17.8 GB on 24 GB Mac).
     let kv_headroom = estimate_kv_bytes(metadata, context_length);
-    let gpu_bytes = gpu_max
-        .min(usable)
+    let metal_safe_limit = gpu_max.min(usable);
+
+    let arch_lower = metadata.architecture.to_lowercase();
+    let is_ssm_hybrid = arch_lower.contains("gemma")
+        || arch_lower.contains("delta")
+        || arch_lower.contains("mamba")
+        || arch_lower.contains("rwkv")
+        || arch_lower.contains("jamba");
+
+    let gpu_overhead = if is_ssm_hybrid {
+        5800 * 1024 * 1024
+    } else if hw.memory.total_bytes <= 24 * 1024 * 1024 * 1024 {
+        4800 * 1024 * 1024
+    } else {
+        GPU_RUNTIME_OVERHEAD
+    };
+
+    let gpu_bytes = metal_safe_limit
         .saturating_sub(kv_headroom)
-        .saturating_sub(GPU_RUNTIME_OVERHEAD);
+        .saturating_sub(gpu_overhead);
     let ram_bytes = usable.saturating_sub(gpu_bytes).saturating_sub(kv_headroom);
     let unified_limit = usable.saturating_sub(kv_headroom);
 
@@ -267,10 +281,6 @@ fn try_sparse_moe_mmap(
         return None;
     }
 
-    // All tensors go to GPU tier — mmap handles data.
-    // If the model exceeds Metal's working set, gpu_layers_from_placement will
-    // detect this and return ngl=0 (CPU-only). The OS page cache still works
-    // because only ~2% of pages are active per token.
     let mut assignments = HashMap::new();
     for t in tensors {
         assignments.insert(t.name.clone(), StorageTier::Gpu);
@@ -284,7 +294,7 @@ fn try_sparse_moe_mmap(
         experts_total,
         active_bytes as f64 / (1u64 << 30) as f64,
         total_bytes as f64 / (1u64 << 30) as f64,
-        if fits_gpu { "" } else { " (exceeds GPU, will use CPU-only)" },
+        if fits_gpu { " (100% GPU offload)" } else { " (partial GPU offload up to budget)" },
     );
 
     Some(assignments)
@@ -397,8 +407,9 @@ fn try_dense_ffn_streaming_assign(
     let ffn_bytes: u64 = tensors.iter().filter(|t| is_ffn(&t.role)).map(|t| t.size_bytes).sum();
 
     let total = non_ffn_bytes + ffn_bytes;
+    // On unified memory, only trigger NVMe streaming if the model exceeds the unified RAM capacity
     if non_ffn_bytes > caps.unified_limit || total <= caps.unified_limit {
-        return None; // Either doesn't fit at all, or everything fits
+        return None; // Either doesn't fit at all, or everything fits resident in unified memory
     }
 
     if ffn_bytes == 0 {
@@ -626,9 +637,13 @@ fn lp_assign(
         x_nvme.push(vars.add(variable().binary()));
     }
 
-    // Binary variable per layer: 1 = NVMe, 0 = GPU/RAM
+    // Binary variables per layer
+    let mut layer_gpu = Vec::with_capacity(num_layers);
+    let mut layer_ram = Vec::with_capacity(num_layers);
     let mut layer_nvme = Vec::with_capacity(num_layers);
     for _ in 0..num_layers {
+        layer_gpu.push(vars.add(variable().binary()));
+        layer_ram.push(vars.add(variable().binary()));
         layer_nvme.push(vars.add(variable().binary()));
     }
 
@@ -650,7 +665,7 @@ fn lp_assign(
             continue;
         }
         let weight = t.size_bytes as f64 * t.access_freq;
-        objective += x_gpu[i] * (weight / gpu_bw);
+        objective += x_gpu[i] * (weight / (gpu_bw * 2.0));
         objective += x_ram[i] * (weight / ram_bw);
         objective += x_nvme[i] * (weight / nvme_bw);
     }
@@ -672,8 +687,9 @@ fn lp_assign(
             }
             let weight = t.size_bytes as f64 * t.access_freq;
 
-            // GPU and RAM transfers contribute to compute time
-            compute_expr += x_gpu[i] * (weight / gpu_bw);
+            // GPU and RAM transfers contribute to compute time.
+            // On unified memory, prefer GPU tier (x_gpu) over RAM (x_ram) by giving GPU a strong objective preference (2.0x).
+            compute_expr += x_gpu[i] * (weight / (gpu_bw * 2.0));
             compute_expr += x_ram[i] * (weight / ram_bw);
 
             // NVMe transfers contribute to I/O time (with MoE cache-hit discount)
@@ -729,16 +745,28 @@ fn lp_assign(
     }
     problem = problem.with(constraint!(unified_sum <= caps.unified_limit as f64));
 
+    // Each layer assigned to exactly one tier
+    for j in 0..num_layers {
+        problem = problem.with(constraint!(layer_gpu[j] + layer_ram[j] + layer_nvme[j] == 1.0));
+    }
+
+    // Layer contiguity: monotonicity — GPU layers come first (1 -> 0)
+    for j in 1..num_layers {
+        problem = problem.with(constraint!(layer_gpu[j] <= layer_gpu[j - 1]));
+    }
+
     // Layer contiguity: monotonicity — once NVMe starts, it stays NVMe
     for j in 1..num_layers {
         problem = problem.with(constraint!(layer_nvme[j] >= layer_nvme[j - 1]));
     }
 
-    // Link tensor NVMe vars to layer NVMe vars:
-    // All tensors in a layer share the same NVMe/non-NVMe assignment
+    // Link tensor tier vars to layer tier vars:
+    // All tensors in a layer share the exact same tier assignment
     for (i, t) in tensors.iter().enumerate() {
         if let Some(layer) = t.layer_index {
             if let Some(&j) = layer_pos.get(&layer) {
+                problem = problem.with(constraint!(x_gpu[i] == layer_gpu[j]));
+                problem = problem.with(constraint!(x_ram[i] == layer_ram[j]));
                 problem = problem.with(constraint!(x_nvme[i] == layer_nvme[j]));
             }
         }
@@ -787,17 +815,11 @@ fn compute_kv_cache_plan(
 
     let total_fp16_kv = kv_per_token_fp16 * context_length as u64;
 
-    // Auto-select Q8 KV when GPU budget is tight:
-    // FP16 KV exceeds 40% of GPU budget, but Q8 KV fits in 25%
-    let kv_quantization = if caps.gpu_bytes > 0
-        && total_fp16_kv > caps.gpu_bytes * 2 / 5
-        && (total_fp16_kv / 2) <= caps.gpu_bytes / 4
-    {
-        tracing::info!(
-            "Auto-selecting Q8 KV: FP16 KV {:.1} GB > 40% of GPU {:.1} GB",
-            total_fp16_kv as f64 / (1u64 << 30) as f64,
-            caps.gpu_bytes as f64 / (1u64 << 30) as f64,
-        );
+    // Auto-select KV quantization when GPU headroom is tight:
+    // If FP16 KV exceeds 500 MB or GPU headroom is < 3 GB, use Q8_0
+    let kv_quantization = if total_fp16_kv > (1u64 << 30) || caps.gpu_bytes < total_fp16_kv + (2 * (1 << 30)) {
+        Some(KvQuantization::Q8_0)
+    } else if total_fp16_kv > (500 * (1 << 20)) {
         Some(KvQuantization::Q8_0)
     } else {
         None
