@@ -6,7 +6,7 @@ set -e
 # ==============================================================================
 
 PORT=6000
-CONTEXT=8192  # Default 8k context window (client can override per request via num_ctx)
+CONTEXT="${HYPURA_CONTEXT:-16384}"  # Default 16k context window (client can override per request via num_ctx)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$SCRIPT_DIR"
 
@@ -46,7 +46,7 @@ FUNNEL_URL=$(tailscale funnel status 2>/dev/null | grep -o 'https://[a-zA-Z0-9.-
 
 echo ""
 echo "=========================================================="
-echo " Hypura Ollama-Compatible Multi-Model Server"
+echo " Hypura Ollama & OpenAI Compatible Multi-Model Server"
 if [ -n "$MODEL" ]; then
     echo " Mode:           Pre-warmed ($MODEL)"
 else
@@ -63,6 +63,7 @@ fi
 if [ -n "$FUNNEL_URL" ]; then
     echo " Public HTTPS:   $FUNNEL_URL"
 fi
+echo " APIs:           Ollama (/api/*) & OpenAI (/v1/*)"
 echo "=========================================================="
 echo ""
 

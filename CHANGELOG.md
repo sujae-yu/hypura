@@ -4,6 +4,81 @@ All notable changes to the **Hypura** project are documented in this file.
 
 ---
 
+## [0.2.4] - 2026-09-09
+
+### ✨ Features & Enhancements
+
+#### 1. Full OpenAI-Compatible API Support (`/v1/*` and direct route aliases)
+* Added standard OpenAI endpoints to allow seamless drop-in integration with tools like **TealKit**, **Cursor**, **Cline**, **Continue.dev**, **LangChain**, and official OpenAI SDKs:
+  * `GET /v1/models` and `GET /models` — lists all discovered local and Ollama models in OpenAI model object format.
+  * `POST /v1/chat/completions` and `POST /chat/completions` — supports single responses, structured `tool_calls` output, thought/reasoning channel stripping, and Server-Sent Events (SSE) streaming (`stream: true`).
+  * `POST /v1/completions` and `POST /completions` — text completion with SSE streaming.
+* Defined standard request and response data structures in `src/server/openai_types.rs`.
+* Implemented Server-Sent Events streaming handlers (`sse_openai_chat_stream`, `sse_openai_completion_stream`) in `src/server/streaming.rs`.
+
+#### 2. Metal Memory & Context Overflow Protections
+* **Strict Memory Capacity Check for Sparse MoE (`src/scheduler/placement.rs`):** Ensured `try_sparse_moe_mmap` verifies that the total mapped model size strictly fits within the unified memory ceiling, preventing Metal `kIOGPUCommandBufferCallbackErrorOutOfMemory` command buffer failures.
+* **Safety Prompt Windowing (`src/compute/inference.rs`):** Added automatic prompt truncation when massive tool outputs exceed the context capacity, preventing `failed to find a memory slot for batch` / unrecoverable KV cache exhaustion.
+* **Effective Context Clamping (`src/compute/inference.rs`):** Capped `effective_ctx` to the server's configured context boundary (`config.n_ctx`) so multi-turn tool outputs do not trigger unbounded memory allocation.
+
+#### 3. Dynamic KV Cache & Adaptive GPU Layer Offload
+* **Dynamic Context Scaling (`src/server/manager.rs`):** Replaced static `default_context` clamp with dynamic scaling bounded by the model's native context limit (`metadata.context_length`), allowing client requests (`num_ctx`) to safely expand up to 16k, 32k, or native model context.
+* **Adaptive Layer Placement on Context Expansion:** When an incoming request demands more context than currently loaded (`needed_ctx > active.context_size`), `ModelManager` dynamically recomputes the placement plan (`compute_placement_with_context`), automatically offloading fewer layers to GPU if needed to fit the expanded KV cache within the Metal working set without OOM.
+* **OpenAI API Context Option Support (`src/server/openai_types.rs`, `src/server/routes.rs`):** Added `num_ctx` and `options` parsing to `OpenAIChatCompletionRequest` and `OpenAICompletionRequest`, passing client-requested context lengths directly to the dynamic model manager.
+* **Startup Script Default Updated (`start_hypura_funnel.sh`):** Increased default context from 8k to 16k (`CONTEXT="${HYPURA_CONTEXT:-16384}"`) so server startup budgets GPU memory for 16k context upfront.
+
+#### 4. Modern 14B–30B Model Optimization & Evaluation
+* Authored comprehensive analysis and evaluation guide for modern 2026 models in **[docs/MODERN_MODELS_AND_OPENAI_INTERFACE.md](docs/MODERN_MODELS_AND_OPENAI_INTERFACE.md)**.
+* Detailed performance and tier placement guidelines for 24GB & 32GB Apple Silicon Mac mini Pro models (M4 Pro / M5 / M6).
+
+#### 5. CLI & Startup Banner Updates
+* Updated `hypura serve` console output and `start_hypura_funnel.sh` startup script to display both Ollama and OpenAI endpoint availability.
+* Added `.gitignore` rules for benchmark JSON results, test logs, and temporary documentation screenshots.
+
+---
+
+## [0.2.3] - 2026-08-29
+
+### 🎥 Real-World Agent Demos & Verification
+* 📺 **CumulusAI + Hypura: Gemma 4 26B Checks Datalogger Flash Space:** [https://youtu.be/6BRQYrkONqg](https://youtu.be/6BRQYrkONqg)
+  *(Diagnostic check of remote meteorological station datalogger storage via cloud API).*
+* 📺 **CumulusAI + Hypura: Run an Oversized Qwen 3.8 27B on Mac mini M4 Pro – Stations, Reasoning & Charts:** [https://youtu.be/brzBlL2LutQ](https://youtu.be/brzBlL2LutQ)
+  *(Multi-station weather telemetry query, temperature filtering, reasoning, and chart formatting on 24GB Unified RAM).*
+* Detailed benchmark summary available in **[docs/REAL_WORLD_TESTS.md](docs/REAL_WORLD_TESTS.md)**.
+
+### ✨ Features & Enhancements
+
+#### 1. Full CORS Middleware Support (`src/server/routes.rs`)
+* Integrated `tower-http` CORS layer allowing browser-based web applications (such as web clients for CumulusAI, OpenWebUI, or custom agent frontends) to connect over local network or remote HTTPS tunnels (e.g. Tailscale Funnel).
+* Automatically handles browser preflight `OPTIONS` requests and configures `Access-Control-Allow-Origin: *`, `Access-Control-Allow-Methods`, and `Access-Control-Allow-Headers`.
+* Fully supports cross-origin chunked NDJSON streaming (`/api/chat`, `/api/generate`).
+
+#### 2. Stream Chunk Deduplication (`src/server/streaming.rs`)
+* Fixed the final streaming chunk (`done: true`) to emit an empty delta string (`message.content = ""`) in compliance with the Ollama streaming protocol.
+* **Fixes UI Duplication:** Prevents web and desktop chat interfaces from duplicating the generated message or tables at the end of streaming.
+
+#### 3. Multi-Model Native Tool Calling & Chat Formatting (`src/server/chat.rs`)
+* **Qwen (2.5 & 3.8 27B):** Added XML and ChatML parameter extraction with reasoning/think tag isolation to prevent parameter cross-contamination and over-execution loops.
+* **Mistral & Ministral (Small 24B, Ministral 3 14B):** Added native `[INST]`, `[AVAILABLE_TOOLS]`, and `[TOOL_RESULTS]` format support.
+* **Gemma (4-26B & 4-31B):** Added `<start_of_turn>` / `<end_of_turn>` and `<|tool_call|>` support with automatic thought channel filtering (`<|channel>thought...<channel|>`).
+* **IBM Granite (4.1 30B):** Structured turn boundaries and stop sequence detection.
+* **GLM-4:** Added native GLM-4 prompt template and tool observation formatting.
+
+#### 4. GLM-4 MoE Lite Architecture & Multi-Head Latent Attention (MLA) Support
+* Implemented `LLM_ARCH_GLM4MOELITE` support across the model loader, compute graph, and RoPE.
+* Optimized KV cache sizing for compressed MLA dimensions (576 dims per token), maximizing GPU layer offloading (up to 45/48 layers on 24GB Unified RAM).
+
+#### 5. Metal Memory Headroom & SSM Hybrid Stability (`src/compute/inference.rs`, `src/scheduler/placement.rs`)
+* **SSM / Gated Delta Net Headroom:** Added automatic architecture detection and scaled the Metal safety headroom (up to 5.8 GB) for hybrid SSM models (Gemma 4, Gated Delta Net, Mamba) on unified memory machines.
+* **Eliminates Metal OOM:** Resolves `kIOGPUCommandBufferCallbackErrorOutOfMemory` command buffer failures on 24GB Apple Silicon Macs when evaluating models with 180+ compute graph splits.
+* **Dynamic Context Headroom:** Automatically scales `effective_ctx` for large multi-turn tool payloads (tested with 25KB+ tool responses) to prevent KV cache saturation.
+
+#### 6. Multi-Turn Resident Model Caching (`src/server/manager.rs`)
+* Retains active models in memory between multi-turn tool execution steps without redundant reloads.
+* Enforces server context limits to safeguard against client requests requesting oversized context windows.
+
+---
+
 ## [0.2.2] - 2026-08-20
 
 ### ✨ Features & Bug Fixes
